@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Napoleonic Tactics: Final Edition</title>
+    <style>
+        body { background: #1a1a1a; color: #eee; font-family: 'Courier New', monospace; display: flex; flex-direction: column; align-items: center; margin: 0; height: 100vh; overflow: hidden; }
+        #game-container { position: relative; margin-top: 10px; box-shadow: 0 0 20px rgba(0,0,0,0.8); border: 4px solid #444; }
+        canvas { display: block; background: #3a5f0b; image-rendering: pixelated; cursor: crosshair; }
+        .overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 10; display: flex; flex-direction: column; justify-content: center; align-items: center; }
+        .hidden { display: none !important; }
+        #hud { width: 640px; height: 60px; display: flex; justify-content: space-between; align-items: center; background: #222; padding: 0 15px; box-sizing: border-box; border-bottom: 2px solid #555; }
+        #action-panel { display: flex; gap: 5px; opacity: 0.3; pointer-events: none; }
+        #action-panel.active { opacity: 1; pointer-events: all; }
+        button { padding: 8px 12px; font-family: inherit; font-weight: bold; background: #444; color: #fff; border: 2px solid #777; cursor: pointer; }
+        button.active { background: #d4af37; color: #000; border-color: #fff; }
+        #unit-selector { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 20px; }
+        .unit-card { border: 2px solid #555; padding: 10px; text-align: center; cursor: pointer; width: 80px; transition: 0.2s; }
+        .unit-card:hover { border-color: gold; background: #333; }
+    </style>
+</head>
+<body>
+
+    <div id="hud">
+        <div id="turn-indicator">Phase: Setup</div>
+        <div id="action-panel">
+            <button onclick="setFormation('line')" id="btn-line">Line</button>
+            <button onclick="setFormation('column')" id="btn-col">Col</button>
+            <button onclick="setFormation('square')" id="btn-sq">Sqr</button>
+        </div>
+        <button id="end-turn-btn" onclick="endPlayerTurn()" disabled>End Turn</button>
+    </div>
+
+    <div id="game-container">
+        <canvas id="gameCanvas" width="640" height="640"></canvas>
+        
+        <div id="screen-selection" class="overlay">
+            <h2>Draft Your Army (5 Units)</h2>
+            <div id="unit-selector">
+                <div class="unit-card" onclick="draftUnit('infantry')"><h3>Inf</h3><small>All-rounder</small></div>
+                <div class="unit-card" onclick="draftUnit('cavalry')"><h3>Cav</h3><small>Fast/Flank</small></div>
+                <div class="unit-card" onclick="draftUnit('artillery')"><h3>Art</h3><small>Long Range</small></div>
+                <div class="unit-card" onclick="draftUnit('officer')"><h3>Off</h3><small>Buff Aura</small></div>
+            </div>
+            <div id="draft-status">Selected: 0/5</div>
+            <button id="btn-start-deploy" onclick="startDeployment()" disabled>Deploy</button>
+        </div>
+
+        <div id="screen-gameover" class="overlay hidden">
+            <h1 id="end-title">VICTORY</h1>
+            <button onclick="location.reload()">Play Again</button>
+        </div>
+    </div>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const uiTurn = document.getElementById('turn-indicator');
+const actionPanel = document.getElementById('action-panel');
+
+const GRID_SIZE = 10;
+const TILE_SIZE = 64;
+let mouseX = 0, mouseY = 0;
+
+const TERRAIN = {
+    OPEN:   { name: "Open Field", id: 0, color: '#5da130', def: 0,  cost: 1 },
+    FOREST: { name: "Forest",     id: 1, color: '#2d5a27', def: 30, cost: 2 },
+    HILL:   { name: "Hill",       id: 2, color: '#8c7b48', def: 20, cost: 2 },
+    FORT:   { name: "Fortress",   id: 3, color: '#606060', def: 50, cost: 1 }
+};
+
+const UNIT_STATS = {
+    infantry: { hp: 100, move: 2, range: 2, power: 30 },
+    officer:  { hp: 120, move: 2, range: 2, power: 35 },
+    cavalry:  { hp: 90,  move: 4, range: 1, power: 45 },
+    artillery:{ hp: 50,  move: 1, range: 4, power: 60 }
+};
+
+let gameState = 'SELECTION', map = [], units = [], particles = [], playerDraft = [], turn = 'player', selectedUnit = null, deployCount = 0;
+
+function initMap() {
+    map = [];
+    for(let y=0; y<GRID_SIZE; y++){
+        let row = [];
+        for(let x=0; x<GRID_SIZE; x++){
+            let r = Math.random();
+            if(r > 0.95) row.push(TERRAIN.FORT);
+            else if(r > 0.85) row.push(TERRAIN.HILL);
+            else if(r > 0.70) row.push(TERRAIN.FOREST);
+            else row.push(TERRAIN.OPEN);
+        }
+        map.push(row);
+    }
+}
+
+function draftUnit(type) {
+    if(playerDraft.length < 5) {
+        playerDraft.push(type);
+        document.getElementById('draft-status').innerText = `Selected: ${playerDraft.length}/5`;
+        if(playerDraft.length === 5) document.getElementById('btn-start-deploy').disabled = false;
+    }
+}
+
+function startDeployment() {
+    gameState = 'DEPLOYMENT';
+    document.getElementById('screen-selection').classList.add('hidden');
+    uiTurn.innerText = "Deploy (Bottom Rows)";
+    initMap();
+    requestAnimationFrame(gameLoop);
+}
+
+function spawnUnit(x, y, type, side) {
+    const stats = UNIT_STATS[type];
+    units.push({
+        x, y, type, side, hp: stats.hp, maxHp: stats.hp,
+        baseMove: stats.move, atkRange: stats.range, power: stats.power,
+        formation: 'line', facing: (side === 'player' ? 'up' : 'down'),
+        hasMoved: false, hasFired: false
+    });
+}
+
+function getUnitAt(x, y) { return units.find(u => u.x === x && u.y === y); }
+
+function performAttack(attacker, target) {
+    createSmoke(attacker.x * TILE_SIZE + 32, attacker.y * TILE_SIZE + 32);
+    const allies = units.filter(u => u.side === attacker.side && u.type === 'officer');
+    let hasAura = allies.some(a => Math.abs(a.x - attacker.x) <= 2 && Math.abs(a.y - attacker.y) <= 2);
+    let auraMod = hasAura ? 1.25 : 1.0;
+
+    let baseDmg = (attacker.power * auraMod) * (1 - (map[target.y][target.x].def / 100));
+    let multiplier = 1.0;
+
+    let dx = attacker.x - target.x, dy = attacker.y - target.y;
+    let attackDir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? "right" : "left") : (dy > 0 ? "down" : "up");
+
+    if (attackDir === target.facing) multiplier = 2.0; // Backstab
+    else if (attackDir !== (target.facing === 'up' ? 'down' : target.facing === 'down' ? 'up' : target.facing === 'left' ? 'right' : 'left')) multiplier = 1.5; // Flank
+
+    if (attacker.type === 'cavalry' && target.formation === 'square') { attacker.hp -= 25; multiplier = 0.1; }
+    
+    target.hp -= Math.floor(baseDmg * multiplier * (0.8 + Math.random() * 0.4));
+    attacker.hasFired = true; 
+    attacker.hasMoved = true;
+    units = units.filter(u => u.hp > 0);
+    checkVictory();
+}
+
+async function runEnemyAI() {
+    turn = 'enemy'; uiTurn.innerText = "Enemy Turn...";
+    document.getElementById('end-turn-btn').disabled = true;
+    
+    for (let u of units.filter(u => u.side === 'enemy')) {
+        let targets = units.filter(t => t.side === 'player');
+        if(!targets.length) break;
+        
+        targets.sort((a,b) => (Math.abs(a.x-u.x)+Math.abs(a.y-u.y)) - (Math.abs(b.x-u.x)+Math.abs(b.y-u.y)));
+        let target = targets[0];
+        
+        // Move towards closest
+        let dist = Math.abs(target.x - u.x) + Math.abs(target.y - u.y);
+        if (dist > u.atkRange) {
+            let dx = Math.sign(target.x - u.x), dy = Math.sign(target.y - u.y);
+            let nx = u.x + dx, ny = u.y + dy;
+            if(!getUnitAt(nx, ny) && ny >= 0 && ny < 10) { 
+                u.x = nx; u.y = ny; u.facing = dy > 0 ? 'down' : 'up';
+            }
+        }
+        
+        // Attack if possible
+        if (Math.abs(target.x - u.x) + Math.abs(target.y - u.y) <= u.atkRange) {
+            await new Promise(r => setTimeout(r, 400));
+            performAttack(u, target);
+        }
+        await new Promise(r => setTimeout(r, 400));
+    }
+    startPlayerTurn();
+}
+
+function startPlayerTurn() {
+    turn = 'player'; uiTurn.innerText = "Your Turn";
+    document.getElementById('end-turn-btn').disabled = false;
+    units.forEach(u => { u.hasMoved = false; u.hasFired = false; });
+}
+
+function endPlayerTurn() { if(turn === 'player') runEnemyAI(); }
+function setFormation(f) { if(selectedUnit && !selectedUnit.hasMoved) { selectedUnit.formation = f; selectedUnit.hasMoved = true; updateUI(); } }
+function updateUI() { actionPanel.classList.toggle('active', !!(selectedUnit && !selectedUnit.hasMoved && turn === 'player')); }
+
+canvas.addEventListener('mousemove', e => { mouseX = e.offsetX; mouseY = e.offsetY; });
+canvas.addEventListener('mousedown', e => {
+    const x = Math.floor(e.offsetX / TILE_SIZE), y = Math.floor(e.offsetY / TILE_SIZE);
+    
+    if (gameState === 'DEPLOYMENT' && y >= 8 && !getUnitAt(x, y)) {
+        spawnUnit(x, y, playerDraft[deployCount++], 'player');
+        if (deployCount >= 5) {
+            for(let i=0; i<5; i++) spawnUnit(i*2, 0, 'infantry', 'enemy');
+            gameState = 'BATTLE'; startPlayerTurn();
+        }
+    } else if (turn === 'player') {
+        const clicked = getUnitAt(x, y);
+        
+        // ATTACK LOGIC
+        if (selectedUnit && clicked?.side === 'enemy' && !selectedUnit.hasFired) {
+            if(Math.abs(x - selectedUnit.x) + Math.abs(y - selectedUnit.y) <= selectedUnit.atkRange) {
+                performAttack(selectedUnit, clicked);
+            }
+            selectedUnit = null;
+        } 
+        // MOVE LOGIC
+        else if (selectedUnit && !clicked && !selectedUnit.hasMoved) {
+            let cost = map[y][x].cost;
+            let dist = Math.abs(x-selectedUnit.x) + Math.abs(y-selectedUnit.y);
+            if(dist <= (selectedUnit.baseMove / cost) || (dist === 1 && selectedUnit.baseMove >= cost)) {
+                let dx = x - selectedUnit.x, dy = y - selectedUnit.y;
+                if(dx !== 0) selectedUnit.facing = dx > 0 ? 'right' : 'left';
+                if(dy !== 0) selectedUnit.facing = dy > 0 ? 'down' : 'up';
+                selectedUnit.x = x; selectedUnit.y = y; 
+                selectedUnit.hasMoved = true; // LOCK MOVEMENT
+            }
+            selectedUnit = null;
+        } 
+        else if (clicked?.side === 'player') {
+            selectedUnit = clicked;
+        }
+        updateUI();
+    }
+});
+
+function drawPixelPerson(ctx, x, y, color, isOfficer) {
+    ctx.fillStyle = '#fff'; ctx.fillRect(x + 2, y + 10, 1, 4); ctx.fillRect(x + 5, y + 10, 1, 4); 
+    ctx.fillStyle = color; ctx.fillRect(x + 1, y + 4, 6, 6); 
+    ctx.fillStyle = '#ffdbac'; ctx.fillRect(x + 2, y + 2, 4, 3); 
+    if (isOfficer) {
+        ctx.fillStyle = '#111'; ctx.fillRect(x - 1, y, 10, 2); ctx.fillStyle = 'gold'; ctx.fillRect(x + 1, y + 5, 6, 1); 
+    } else {
+        ctx.fillStyle = '#111'; ctx.fillRect(x + 2, y - 1, 4, 3); ctx.fillStyle = '#421'; ctx.fillRect(x + 7, y + 2, 1, 8); 
+    }
+}
+
+function drawUnit(ctx, u, x, y) {
+    let color = u.side === 'player' ? '#4682b4' : '#cd5c5c';
+    if (u.hasMoved && u.hasFired) color = '#444';
+
+    if (u.type === 'officer') {
+        ctx.beginPath(); ctx.arc(x+32, y+32, TILE_SIZE*2, 0, Math.PI*2);
+        ctx.strokeStyle = "rgba(212, 175, 55, 0.3)"; ctx.setLineDash([8, 4]); ctx.stroke(); ctx.setLineDash([]);
+    }
+
+    // Facing Arrow
+    ctx.fillStyle = "yellow";
+    if(u.facing === 'up') ctx.fillRect(x+30, y-4, 4, 8);
+    else if(u.facing === 'down') ctx.fillRect(x+30, y+60, 4, 8);
+    else if(u.facing === 'left') ctx.fillRect(x-4, y+30, 8, 4);
+    else if(u.facing === 'right') ctx.fillRect(x+60, y+30, 8, 4);
+
+    if (u.type === 'artillery') {
+        ctx.fillStyle = '#333'; ctx.fillRect(x+10, y+25, 4, 20); ctx.fillRect(x+50, y+25, 4, 20);
+        ctx.fillStyle = '#777'; ctx.fillRect(x+24, y+15, 16, 35);
+    } else if (u.type === 'cavalry') {
+        ctx.fillStyle = '#532'; ctx.fillRect(x+15, y+30, 35, 15); drawPixelPerson(ctx, x+25, y+18, color, false);
+    } else {
+        let isOff = (u.type === 'officer');
+        if (u.formation === 'square') {
+            for(let i=0; i<3; i++) drawPixelPerson(ctx, x+10+(i*18), y+10, color, isOff && i===1);
+            for(let i=0; i<3; i++) drawPixelPerson(ctx, x+10+(i*18), y+40, color, false);
+        } else if (u.formation === 'column') {
+            for(let r=0; r<3; r++) { drawPixelPerson(ctx, x+18, y+8+(r*16), color, isOff && r===0); drawPixelPerson(ctx, x+38, y+8+(r*16), color, false); }
+        } else {
+            for(let i=0; i<4; i++) drawPixelPerson(ctx, x+5+(i*14), y+15, color, isOff && i===0);
+            for(let i=0; i<4; i++) drawPixelPerson(ctx, x+5+(i*14), y+35, color, false);
+        }
+    }
+    // Health
+    ctx.fillStyle = '#000'; ctx.fillRect(x+12, y+58, 40, 4);
+    ctx.fillStyle = (u.hp / u.maxHp > 0.4) ? '#0f0' : '#f00'; ctx.fillRect(x+12, y+58, 40 * (u.hp / u.maxHp), 4);
+}
+
+function createSmoke(x, y) { for(let i=0; i<8; i++) particles.push({ x, y, vx: Math.random()-0.5, vy: Math.random()-0.5, life: 1.0 }); }
+function checkVictory() {
+    const e = units.filter(u=>u.side==='enemy').length, p = units.filter(u=>u.side==='player').length;
+    if(!e || !p) { gameState='GAMEOVER'; document.getElementById('screen-gameover').classList.remove('hidden'); document.getElementById('end-title').innerText = e ? "DEFEAT" : "VICTORY"; }
+}
+
+function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if(map.length > 0) {
+        map.forEach((row, y) => row.forEach((tile, x) => {
+            ctx.fillStyle = tile.color; ctx.fillRect(x*TILE_SIZE, y*TILE_SIZE, TILE_SIZE, TILE_SIZE);
+            if(tile.id===3) { ctx.fillStyle='#444'; ctx.fillRect(x*TILE_SIZE+15, y*TILE_SIZE+15, 34, 34); }
+        }));
+    }
+
+    // Tooltip
+    let hX = Math.floor(mouseX / TILE_SIZE), hY = Math.floor(mouseY / TILE_SIZE);
+    if(map[hY]?.[hX]) {
+        ctx.fillStyle = "rgba(0,0,0,0.8)"; ctx.fillRect(mouseX+10, mouseY+10, 130, 50);
+        ctx.fillStyle = "white"; ctx.font = "bold 11px Courier"; ctx.fillText(map[hY][hX].name, mouseX+15, mouseY+25);
+        ctx.fillText(`Def Bonus: +${map[hY][hX].def}%`, mouseX+15, mouseY+40);
+        ctx.fillText(`Move Cost: ${map[hY][hX].cost}`, mouseX+15, mouseY+53);
+    }
+
+    // Highlight Selected Unit Move Range
+    if(selectedUnit && !selectedUnit.hasMoved) {
+        ctx.fillStyle = "rgba(255,255,255,0.2)";
+        let range = selectedUnit.baseMove;
+        for(let dy=-range; dy<=range; dy++) {
+            for(let dx=-range; dx<=range; dx++) {
+                let tx = selectedUnit.x + dx, ty = selectedUnit.y + dy;
+                if(tx >=0 && tx < 10 && ty >=0 && ty < 10) {
+                    let cost = map[ty][tx].cost;
+                    if(Math.abs(dx)+Math.abs(dy) <= (range/cost) || (Math.abs(dx)+Math.abs(dy)===1 && range >= cost)) 
+                        ctx.fillRect(tx*TILE_SIZE, ty*TILE_SIZE, TILE_SIZE, TILE_SIZE);
+                }
+            }
+        }
+    }
+
+    units.forEach(u => drawUnit(ctx, u, u.x*TILE_SIZE, u.y*TILE_SIZE));
+    particles.forEach((p, i) => {
+        ctx.fillStyle = `rgba(220,220,220,${p.life})`; ctx.fillRect(p.x, p.y, 10, 10);
+        p.x+=p.vx; p.y+=p.vy; p.life-=0.03; if(p.life<=0) particles.splice(i,1);
+    });
+}
+
+function gameLoop() { draw(); requestAnimationFrame(gameLoop); }
+initMap();
+</script>
+</body>
+</html>
